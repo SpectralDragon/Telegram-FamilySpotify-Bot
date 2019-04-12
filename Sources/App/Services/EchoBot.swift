@@ -59,6 +59,12 @@ final class EchoBot: ServiceType {
         let commandHandler = CommandHandler(commands: ["/echo"], callback: echoModeSwitch)
         dispatcher.add(handler: commandHandler)
         
+        let statusHandler = CommandHandler(commands: ["/status"], callback: self.statusHandler)
+        dispatcher.add(handler: statusHandler)
+        
+        let chatHandler = ChatHandler(name: "ChatHandler", options: [.userDidLeft, .newUsersAdded], callback: self.userHandler)
+        dispatcher.add(handler: chatHandler)
+        
         ///Creating and adding handler for ordinary text messages
         let echoHandler = MessageHandler(filters: Filters.text, callback: echoResponse)
         dispatcher.add(handler: echoHandler)
@@ -68,6 +74,28 @@ final class EchoBot: ServiceType {
 }
 
 extension EchoBot {
+    
+    func botAddedHandler(_ update: Update, _ context: BotContext?) throws {
+        
+    }
+    
+    func userHandler(_ result: ChatHandler.Result, _ update: Update) throws {
+        switch result {
+        case .newUsersAdded(let members):
+            return
+        case .userDidLeft(let user):
+            return
+        }
+    }
+    
+    func statusHandler(_ update: Update, _ context: BotContext?) throws {
+        guard let message = update.message,
+            let user = message.from else { return }
+        
+        let params = Bot.SendMessageParams(chatId: .chat(message.chat.id), text: "You stats:")
+        try bot.sendMessage(params: params)
+    }
+    
     ///Callback for Command handler, which send Echo mode status for user
     func echoModeSwitch(_ update: Update, _ context: BotContext?) throws {
         guard let message = update.message,
@@ -95,4 +123,54 @@ extension EchoBot {
         let params = Bot.SendMessageParams(chatId: .chat(message.chat.id), text: message.text!)
         try bot.sendMessage(params: params)
     }
+}
+
+class ChatHandler: Handler {
+    
+    typealias HandlerBlock = (_ result: Result, _ update: Update) throws -> Void
+    
+    var name: String
+    
+    public struct Options: OptionSet {
+        public let rawValue: Int
+        
+        public init(rawValue: Int) {
+            self.rawValue = rawValue
+        }
+        
+        public static let newUsersAdded = Options(rawValue: 0 << 1)
+        
+        public static let userDidLeft = Options(rawValue: 1 << 1)
+    }
+    
+    enum Result {
+        case newUsersAdded([User])
+        case userDidLeft(User)
+    }
+    
+    private var options: Options
+    private var callback: HandlerBlock
+    
+    init(name: String = String(describing: ChatHandler.self), options: Options = [], callback: @escaping HandlerBlock) {
+        self.name = name
+        self.options = options
+        self.callback = callback
+    }
+    
+    func check(update: Update) -> Bool {
+        return true
+    }
+    
+    func handle(update: Update, dispatcher: Dispatcher) throws {
+        if let members = update.message?.newChatMembers, options.contains(.newUsersAdded) {
+            try callback(.newUsersAdded(members), update)
+        }
+        
+        if let user = update.message?.leftChatMember, options.contains(.userDidLeft) {
+            try callback(.userDidLeft(user), update)
+        }
+        
+    }
+    
+    
 }
