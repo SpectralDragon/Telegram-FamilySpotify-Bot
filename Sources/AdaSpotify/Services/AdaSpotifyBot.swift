@@ -1,25 +1,29 @@
 //
-//  EchoBot.swift
-//  EchoBot
+//  AdaSpotifyBot.swift
+//  AdaSpotifyBot
 //
-//  Created by Givi Pataridze on 31.05.2018.
+//  Created by Vladislav Prusakov on 12.04.2019.
 //
 
 import Foundation
 import Telegrammer
 import Vapor
+import FluentSQLite
 
-final class EchoBot: ServiceType {
+final class AdaSpotifyBot: ServiceType {
     
     let bot: Bot
+    let worker: Container
     var updater: Updater?
     var dispatcher: Dispatcher?
     
     /// Dictionary for user echo modes
     var userEchoModes: [Int64: Bool] = [:]
     
+    var familyContexts: [Int64: FamilyCreateContext] = [:]
+    
     ///Conformance to `ServiceType` protocol, fabric methhod
-    static func makeService(for worker: Container) throws -> EchoBot {
+    static func makeService(for worker: Container) throws -> AdaSpotifyBot {
         guard let token = Environment.get("TELEGRAM_BOT_TOKEN") else {
             throw CoreError(identifier: "Enviroment variables", reason: "Cannot find telegram bot token")
         }
@@ -39,11 +43,12 @@ final class EchoBot: ServiceType {
         /// If you are using self-signed certificate, point it's filename
         // settings.webhooksPublicCert = "public.pem"
         
-        return try EchoBot(settings: settings)
+        return try AdaSpotifyBot(settings: settings, worker: worker)
     }
     
-    init(settings: Bot.Settings) throws {
+    init(settings: Bot.Settings, worker: Container) throws {
         self.bot = try Bot(settings: settings)
+        self.worker = worker
         let dispatcher = try configureDispatcher()
         self.dispatcher = dispatcher
         self.updater = Updater(bot: bot, dispatcher: dispatcher)
@@ -53,31 +58,35 @@ final class EchoBot: ServiceType {
     /// and pass them throught handlers pipeline
     func configureDispatcher() throws -> Dispatcher {
         ///Dispatcher - handle all incoming messages
+        
         let dispatcher = Dispatcher(bot: bot)
         
-        ///Creating and adding handler for command /echo
-        let commandHandler = CommandHandler(commands: ["/echo"], callback: echoModeSwitch)
-        dispatcher.add(handler: commandHandler)
+        // Others
+        
+        let helpHandler = CommandHandler(commands: ["/start", "/help"], callback: self.helpHandler)
+        dispatcher.add(handler: helpHandler)
         
         let statusHandler = CommandHandler(commands: ["/status"], callback: self.statusHandler)
         dispatcher.add(handler: statusHandler)
         
-        let chatHandler = ChatHandler(name: "ChatHandler", options: [.userDidLeft, .newUsersAdded], callback: self.userHandler)
-        dispatcher.add(handler: chatHandler)
+//        let chatHandler = ChatHandler(name: "ChatHandler", options: [.userDidLeft, .newUsersAdded], callback: self.userHandler)
+//        dispatcher.add(handler: chatHandler)
         
-        ///Creating and adding handler for ordinary text messages
-        let echoHandler = MessageHandler(filters: Filters.text, callback: echoResponse)
-        dispatcher.add(handler: echoHandler)
+        // Family
+        
+        let createFamilyHandler = CommandHandler(commands: ["/create"], callback: self.createFamily)
+        dispatcher.add(handler: createFamilyHandler)
+        
+        let familyCreateContextHandlers = [MessageHandler(filters: Filters.text, callback: createFamilyContextResponse),
+                                           MessageHandler(filters: Filters.contact, callback: createFamilyContextResponse),
+                                           MessageHandler(filters: Filters.entity(types: [.mention, .textMention]), callback: createFamilyContextResponse)]
+        familyCreateContextHandlers.forEach { dispatcher.add(handler: $0) }
         
         return dispatcher
     }
 }
 
-extension EchoBot {
-    
-    func botAddedHandler(_ update: Update, _ context: BotContext?) throws {
-        
-    }
+extension AdaSpotifyBot {
     
     func userHandler(_ result: ChatHandler.Result, _ update: Update) throws {
         switch result {
@@ -86,6 +95,53 @@ extension EchoBot {
         case .userDidLeft(let user):
             return
         }
+    }
+    
+    func helpHandler(_ update: Update, _ context: BotContext?) throws {
+        
+        guard let message = update.message, let user = message.from else { return }
+        
+        let identifier = DatabaseIdentifier<SQLiteDatabase>(UUID().uuidString)
+        let connection = try worker.requestPooledConnection(to: identifier).syncResolve()
+        let query = Family.query(on: connection)
+            .join(\Family.memberIds, to: \Member.id)
+            .alsoDecode(Member.self)
+        let filters = query.filter(\Member.id == Int(user.id))
+        
+        try worker.releasePooledConnection(connection, to: identifier)
+        
+        var userIsOwner: Bool = false
+        
+        if let response = try filters.first().syncResolve() {
+            userIsOwner = response.0.chatId == Int(message.chat.id) && response.1.isOwner
+        }
+        
+        let ownerPart = """
+        For owners:
+        
+        Remove family: /remove_family
+        Add new member: /add_member
+        Delete member: /delete_member
+        Set monthly price: /set_pay - price will devide only 5 members
+        """
+        
+        let help = """
+        Welcome to Ada Spotify Family Bot.
+
+        Ada can help you manage your subscription and paayments using telegram.
+        You don't need access to Spotify, only chat with members in your family.
+
+        If you wanna create your family sent me: /create
+        \(userIsOwner ? "\n\(ownerPart)\n" : "")
+        For members:
+        
+        Get status of debt and info about home: /status
+        Pay now: /pay
+
+        Good luck and have a nice playlists!
+        """
+        
+        try bot.sendMessage(help, chatId: message.chat.id)
     }
     
     func statusHandler(_ update: Update, _ context: BotContext?) throws {
@@ -122,6 +178,32 @@ extension EchoBot {
             on == true else { return }
         let params = Bot.SendMessageParams(chatId: .chat(message.chat.id), text: message.text!)
         try bot.sendMessage(params: params)
+    }
+    
+    // MARK: - Family
+    
+    func createFamily(_ update: Update, _ context: BotContext?) throws {
+        guard let message = update.message,
+            let user = message.from else { return }
+        
+        let context = FamilyCreateContext(worker: self.worker, bot: self.bot, creatorId: user.id)
+        self.familyContexts[user.id] = context
+        
+        try bot.sendMessage("Welcome to family creation mode. Please, sent me family street address from you Spotify", chatId: message.chat.id)
+    }
+    
+    func createFamilyContextResponse(_ update: Update, _ context: BotContext?) throws {
+        guard let message = update.message,
+            let user = message.from,
+            let familyContext = self.familyContexts[user.id] else { return }
+        
+        do {
+            try familyContext.handleMessageForCurrentState(message)
+        } catch {
+            try bot.sendMessage(error.localizedDescription, chatId: message.chat.id)
+            throw error
+        }
+        
     }
 }
 
