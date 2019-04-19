@@ -10,7 +10,7 @@ import Telegrammer
 import Vapor
 import FluentSQLite
 
-final class FamilyCreateContext {
+final class FamilyCreateContext: BotFlowContext {
     
     private let bot: Bot
     private let worker: Container
@@ -34,12 +34,12 @@ final class FamilyCreateContext {
     
     private enum Step: Int {
         case streetName = 0
-        case streetNumber = 1
-        case city = 2
-        case zipCode = 3
-        case members = 4
-        case check = 5
-        case completed = 6
+        case streetNumber
+        case city
+        case zipCode
+        case members
+        case check
+        case completed
         
         case cancelled = 100
     }
@@ -47,6 +47,10 @@ final class FamilyCreateContext {
     private var house: House = House()
     private var members: [Member] = []
     private var currentStep = Step.streetName
+    
+    func prepare(chatId: Int64, user: User) throws {
+         try bot.sendMessage("Welcome to family creation mode!\nPlease, sent me family street address from you Spotify.\n\nFor cancelling sent /cancel", chatId: chatId)
+    }
     
     func handleMessageForCurrentState(_ message: Message) throws {
         
@@ -83,6 +87,7 @@ final class FamilyCreateContext {
                     break
                 case .finish:
                     try finishOfferMessage(chatId: message.chat.id, locale: locale)
+                    break
                 }
             }
             
@@ -99,15 +104,12 @@ final class FamilyCreateContext {
             
             if let entities = message.entities {
                 for entity in entities {
-                    if entity.type == .textMention {
-                        guard let user = entity.user else { continue }
-                        
-                        member = try self.makeMember(by: user, contact: nil)
-                    } else if entity.type == .mention {
-                        
-                        let mention = (message.text.orEmpty as NSString).substring(with: NSRange(entity.offset..<entity.length))
-                        let user = try self.getChatMember(byUsername: mention, chatId: .chat(message.chat.id)).user
-                        member = try self.makeMember(by: user, contact: nil)
+                    switch entity.type {
+                    case .textMention:
+                        if let user = entity.user {
+                            member = try self.makeMember(by: user, contact: nil)
+                        }
+                    default: continue
                     }
                 }
             }
@@ -122,7 +124,7 @@ final class FamilyCreateContext {
             } else {
                 try finishOfferMessage(chatId: message.chat.id, locale: locale)
             }
-            
+            return
         case .check:
             let text = try returnMessageIfIsNotEmptyOrNil(message)
             guard let checkAnswer = CheckAnswer(rawValue: text) else { return }
@@ -202,16 +204,12 @@ final class FamilyCreateContext {
     
     private func getChatMember(forUserId userId: Int64, chatId: ChatId) throws -> ChatMember {
         let params = Bot.GetChatMemberParams(chatId: chatId, userId: userId)
-        
-        return try sync { result in
-            try self.bot.getChatMember(params: params)
-                .do { member in
-                    result(.success(member))
-                }
-                .catch { error in
-                    result(.failure(error))
-            }
-        }
+        return try self.bot.getChatMember(params: params).safeWait()
+    }
+    
+    private func getChat(username: String) throws -> Chat {
+        let params = Bot.GetChatParams(chatId: .username(username))
+        return try bot.getChat(params: params).safeWait()
     }
     
     private func saveFamily(chatId: Int64) throws {
@@ -223,28 +221,26 @@ final class FamilyCreateContext {
             throw ASError("You don't set are members. Please, try again.")
         }
         
-        let identifier = DatabaseIdentifier<SQLiteDatabase>(UUID().uuidString)
-        let connection = try worker.requestCachedConnection(to: identifier).syncResolve()
-        
-        let ids: [Int] = try self.members.compactMap {
-            let savedMember = try $0.create(on: connection).syncResolve()
-            return savedMember.id
+        worker.requestCachedConnection(to: .sqlite).do { [weak self] connection in
+            guard let `self` = self else { return }
+            
+            do {
+                let ids: [Int] = try self.members.compactMap {
+                    let savedMember = try $0.create(on: connection).safeWait()
+                    return savedMember.id
+                }
+                
+                let family = Family(chatId: Int(chatId), houseId: houseId, membersIds: Set(ids))
+                _ = try family.create(on: connection).safeWait()
+            } catch { try? self.bot.sendMessage("Something went wrong", chatId: chatId) }
+            
+            }.catch { _ in
+                try? self.bot.sendMessage("Something went wrong", chatId: chatId)
         }
-        
-        let family = Family(chatId: Int(chatId), houseId: houseId, membersIds: Set(ids))
-        try family.create(on: connection).syncResolve()
-    
-        try worker.releasePooledConnection(connection, to: identifier)
-    }
-    
-    private func getChatMember(byUsername username: String, chatId: ChatId) throws -> ChatMember {
-        let params = Bot.GetChatParams(chatId: .username(username))
-        let chat = try self.bot.getChat(params: params).syncResolve()
-        return try self.getChatMember(forUserId: chat.id, chatId: chatId)
     }
 }
 
-fileprivate extension House {
+extension House {
     func info(forLocale locale: Locale) -> String {
         return """
         Street name: \(self.streetName ?? "Empty")
@@ -255,7 +251,7 @@ fileprivate extension House {
     }
 }
 
-fileprivate extension Member {
+extension Member {
     func info(forLocale locale: Locale) -> String {
         return """
         First name \(self.firstName)
@@ -275,16 +271,6 @@ extension Optional where Wrapped == String {
 extension String {
     var trimmed: String {
         return self.trimmingCharacters(in: .whitespaces)
-    }
-}
-
-extension EventLoopFuture {
-    @discardableResult
-    func syncResolve() throws -> T {
-        return try sync { completion in
-            self.do { completion(.success($0)) }
-                .catch { completion(.failure($0)) }
-        }
     }
 }
 
@@ -309,5 +295,30 @@ protocol Localizable {
 extension String: Localizable {
     func lozalized(for locale: Locale) -> String {
         return NSLocalizedString(self, tableName: "\(locale.languageCode.orEmpty)-localized", bundle: .main, value: self, comment: "")
+    }
+}
+
+@discardableResult
+public func sync<T>(block: (_ finishHandler: @escaping ResultHandler<T>) -> Void) throws -> T {
+    var result: Result<T, Error> = nil
+    let semaphore = DispatchSemaphore(value: 0)
+    block() { blockResult in
+        result = blockResult
+        semaphore.signal()
+    }
+    semaphore.wait()
+    return try result.get()
+}
+
+extension EventLoopFuture {
+    func safeWait() throws -> T {
+        return try sync { result in
+            self.do{ value in
+                    result(.success(value))
+                }
+                .catch { error in
+                    result(.failure(error))
+            }
+        }
     }
 }
